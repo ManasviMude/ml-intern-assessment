@@ -1,17 +1,14 @@
-# src/ngram_model.py
+﻿# src/ngram_model.py
 from collections import Counter
 import math
 import re
-from typing import List, Iterable, Tuple, Optional
+from typing import List, Iterable, Tuple, Optional, Union
 
 
 def _simple_tokenize(text: str) -> List[str]:
-    """
-    Very small tokenizer: split on whitespace and strip common punctuation from token edges.
-    """
+    """Very small tokenizer: split on whitespace and strip punctuation from token edges."""
     tokens = []
     for tok in text.strip().split():
-        # remove surrounding punctuation like ,;:"'()[]{} and stray dots
         tok = tok.strip('.,;:"\'()[]{}')
         if tok:
             tokens.append(tok)
@@ -19,7 +16,7 @@ def _simple_tokenize(text: str) -> List[str]:
 
 
 def get_ngrams(tokens: List[str], n: int) -> List[Tuple[str, ...]]:
-    """Return a list of n-grams padded with <s> and </s>."""
+    """Return a list of n-grams padded with <s> and </s>. Always treats tokens as a list."""
     if n < 1:
         raise ValueError("n must be >= 1")
     padded = ["<s>"] * (n - 1) + list(tokens) + ["</s>"]
@@ -34,11 +31,7 @@ class TrigramModel:
         self.vocab = set()
 
     def _text_to_sentences(self, text: str) -> List[List[str]]:
-        """
-        Split raw text into sentence-token lists.
-        Splits on ., ?, ! and strips whitespace.
-        """
-        # split on sentence-ending punctuation, keep non-empty parts
+        """Split raw text into sentences (basic) and tokenize."""
         parts = re.split(r'[.?!]+', text)
         sentences = []
         for part in parts:
@@ -50,28 +43,28 @@ class TrigramModel:
                 sentences.append(toks)
         return sentences
 
-    def fit(self, corpus: Optional[Iterable[List[str]] or str] = None) -> None:
+    def fit(self, corpus: Optional[Union[str, Iterable[Union[str, Iterable[str]]]]] = None) -> None:
         """
-        Train using either:
-          - a string (raw text) -> it will be split into sentences and tokenized, or
-          - an iterable of token lists (each element is a sentence token list).
+        Train the model.
+        Accepts:
+          - a single raw string (text) -> splits into sentences and tokenizes
+          - an iterable of token-lists (each element is a sentence tokens list)
+          - an iterable of strings (each string is treated as one sentence)
         """
         token_lists: List[List[str]] = []
 
         if corpus is None:
             return
 
-        # If caller passed a string, tokenize into sentences
+        # If corpus is a raw string -> split into sentence token lists
         if isinstance(corpus, str):
             token_lists = self._text_to_sentences(corpus)
         else:
-            # if it's an iterable of lists/strings: convert each element into a token list
+            # it's an iterable - normalize each element into a token list
             for entry in corpus:
                 if isinstance(entry, str):
-                    # treat each entry string as a single sentence
                     token_lists.append(_simple_tokenize(entry))
                 else:
-                    # assume it's already a list/iterable of tokens
                     token_lists.append(list(entry))
 
         # build counts
@@ -83,7 +76,7 @@ class TrigramModel:
             for tg in get_ngrams(tokens, 3):
                 self.trigrams[tg] += 1
 
-        # build vocab excluding padding tokens
+        # build vocab (exclude padding tokens)
         self.vocab = {w for (w,) in self.unigrams if w not in ("<s>", "</s>")}
 
     def trigram_count(self, w1: str, w2: str, w3: str) -> int:
@@ -94,7 +87,7 @@ class TrigramModel:
 
     def trigram_prob(self, w1: str, w2: str, w3: str, add_k: float = 0.0) -> float:
         """Return P(w3 | w1,w2) using MLE with optional add-k smoothing."""
-        vocab_size = max(1, len(self.vocab)) + 1  # +1 for </s> or unseen token
+        vocab_size = max(1, len(self.vocab)) + 1
         numerator = self.trigram_count(w1, w2, w3) + add_k
         denominator = self.bigram_count(w1, w2) + add_k * vocab_size
         if denominator <= 0:
@@ -102,7 +95,6 @@ class TrigramModel:
         return numerator / denominator
 
     def sentence_logprob(self, tokens: List[str], add_k: float = 0.0) -> float:
-        """Compute natural log probability of a token list (returns -inf if any zero-prob trigram)."""
         total = 0.0
         for (w1, w2, w3) in get_ngrams(tokens, 3):
             p = self.trigram_prob(w1, w2, w3, add_k)
@@ -112,10 +104,8 @@ class TrigramModel:
         return total
 
     def top_k(self, w1: str, w2: str, k: int = 5):
-        """Return the top-k candidate next words as (word, prob)."""
         candidates = []
-        candidates_source = list(self.vocab) + ["</s>"]
-        for w in candidates_source:
+        for w in list(self.vocab) + ["</s>"]:
             p = self.trigram_prob(w1, w2, w)
             if p > 0:
                 candidates.append((w, p))
@@ -124,32 +114,36 @@ class TrigramModel:
 
     def generate(self, max_len: int = 50) -> str:
         """
-        Deterministic greedy generator:
-        Start with <s>, <s> then repeatedly pick the highest-probability next word until </s> or max_len.
-        Returns the generated sentence as a normal string (empty string if no data).
+        Greedy deterministic generation with a fallback:
+        - Start with <s>, <s>.
+        - If no trigram candidates have positive probability, fall back to the most common unigram.
         """
         if not self.trigrams:
             return ""
 
         w1, w2 = "<s>", "<s>"
-        out_tokens: List[str] = []
-
+        out: List[str] = []
         for _ in range(max_len):
-            # pick best candidate by probability (deterministic)
             best_word = None
             best_p = 0.0
-            # try all vocab words and the sentence end token
             for w in list(self.vocab) + ["</s>"]:
                 p = self.trigram_prob(w1, w2, w)
                 if p > best_p:
                     best_p = p
                     best_word = w
+
+            # FALLBACK: if no candidate found (best_word is None), pick most frequent unigram
             if best_word is None:
-                break
+                # find most common unigram excluding padding tokens
+                most_common = [w for (w,), _ in self.unigrams.most_common() if w not in ("<s>", "</s>")]
+                if not most_common:
+                    break
+                best_word = most_common[0]
+
             if best_word == "</s>":
                 break
-            out_tokens.append(best_word)
-            # shift
+
+            out.append(best_word)
             w1, w2 = w2, best_word
 
-        return " ".join(out_tokens)
+        return " ".join(out)
